@@ -1,203 +1,243 @@
 import streamlit as st
 st.set_page_config(layout="wide")
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import altair as alt
 import matplotlib
 import os
-import glob  # at the top with other imports
+import glob
 from PIL import Image
-matplotlib.rc('font', family='AppleGothic')  # macOS용 한글 폰트
-plt.rcParams['axes.unicode_minus'] = False  # 마이너스 깨짐 방지
 
-# 데이터 로드
+# ────────────────────────────────────────────────────────────
+# 기본 설정 (폰트‧마이너스 깨짐 방지)
+# ────────────────────────────────────────────────────────────
+matplotlib.rc('font', family='AppleGothic')  # macOS 한글 폰트
+plt.rcParams['axes.unicode_minus'] = False
+
+# ────────────────────────────────────────────────────────────
+# 데이터 로더
+# ────────────────────────────────────────────────────────────
 @st.cache_data
-def load_data():
+def load_pop_data():
+    """유동인구 CSV 로드 & 전처리"""
     df = pd.read_csv("data.csv")
     df['수송일자'] = pd.to_datetime(df['수송일자'])
-    df['요일'] = df['수송일자'].dt.day_name(locale='ko_KR')  # 'Monday' → '월요일' 등
+
+    # locale 설치가 안 된 환경을 위해 weekday 숫자 → 한글 매핑
+    weekday_map = {
+        0: '월요일', 1: '화요일', 2: '수요일', 3: '목요일',
+        4: '금요일', 5: '토요일', 6: '일요일'
+    }
+    df['요일'] = df['수송일자'].dt.weekday.map(weekday_map)
+
     df['총유동인구'] = df.loc[:, df.columns.str.contains("시간대")].sum(axis=1)
     return df
 
-df = load_data()
+@st.cache_data
+def load_store_data():
+    """역구내 상가 현황 CSV 로드 (연도, 연번 열 제거)"""
+    store = pd.read_csv("store.csv")
+    # 역번호(정수) 추출 → 상가번호 앞자리
+    store["역번호"] = store["상가번호"].str.split("-").str[0].astype(int)
+
+    # 역명에 붙은 "(1)" 같은 괄호 제거
+    store["역명"] = store["역명"].str.replace(r"\s*\([^)]*\)", "", regex=True)
+
+    store = store.drop(columns=['연도', '연번'], errors='ignore')
+    return store
+
+pop_df   = load_pop_data()
+store_df = load_store_data()
 
 # 시간대 열 자동 추출
-time_columns = [col for col in df.columns if '시간대' in col]
+TIME_COLS = [c for c in pop_df.columns if '시간대' in c]
 
-# 사이드바 필터
+# ────────────────────────────────────────────────────────────
+# 사이드바 필터링 UI
+# ────────────────────────────────────────────────────────────
 st.sidebar.title("📊 지하철 유동인구 분석")
-역명_list = st.sidebar.multiselect("역 선택 (다중 가능)", sorted(df['역명'].unique()), default=[df['역명'].unique()[0]])
+역명_list = st.sidebar.multiselect("역 선택 (다중 가능)",
+                            sorted(pop_df['역명'].unique()),
+                            default=[pop_df['역명'].unique()[0]])
 구분 = st.sidebar.radio("승하차 구분", ['전체', '승차', '하차'])
-날짜범위 = st.sidebar.date_input("날짜 범위 선택", 
+날짜범위 = st.sidebar.date_input("날짜 범위 선택",
                             value=(pd.to_datetime("2023-01-01"), pd.to_datetime("2023-12-30")),
                             min_value=pd.to_datetime("2023-01-01"),
                             max_value=pd.to_datetime("2023-12-30"))
-
-# 필터링
 start_date, end_date = map(pd.to_datetime, 날짜범위)
-filtered = df[(df['역명'].isin(역명_list)) & 
-              (df['수송일자'] >= start_date) & (df['수송일자'] <= end_date)]
+
+# ────────────────────────────────────────────────────────────
+# 데이터 필터링
+# ────────────────────────────────────────────────────────────
+filtered = pop_df[(pop_df['역명'].isin(역명_list)) &
+                 (pop_df['수송일자'] >= start_date) & (pop_df['수송일자'] <= end_date)]
 if 구분 != '전체':
     filtered = filtered[filtered['승하차구분'] == 구분]
 
-# Tabs
+# ────────────────────────────────────────────────────────────
+# 탭 레이아웃
+# ────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["📊 유동인구 분석", "🏪 상가 위치 보기"])
 
+# ----------------------------------------------------------
+# 📊 TAB 1 : 유동인구 분석
+# ----------------------------------------------------------
 with tab1:
     st.title(f"📍 {', '.join(역명_list)}역 유동인구 분석")
-    st.write(f"### ⏰ {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')} {구분} 시간대별 인원")
+    st.write(f"### ⏰ {start_date.date()} ~ {end_date.date()} {구분} 시간대별 인원")
 
     col_graph, col_stats = st.columns([2, 1])
 
     if not filtered.empty:
+        # ── 라인 차트 ──
         with col_graph:
             fig, ax = plt.subplots(figsize=(12, 4))
             for 역 in 역명_list:
-                row = filtered[filtered['역명'] == 역]
-                if not row.empty:
-                    # 평균값으로 시간대별 인원 계산
-                    values = row[time_columns].mean()
-                    ax.plot(range(len(time_columns)), values, marker='o', label=역)
-            ax.set_xticks(range(len(time_columns)))
-            ax.set_xticklabels(time_columns, rotation=45)
+                rows = filtered[filtered['역명'] == 역]
+                if rows.empty:
+                    continue
+                ax.plot(range(len(TIME_COLS)), rows[TIME_COLS].mean(), marker='o', label=역)
+            ax.set_xticks(range(len(TIME_COLS)))
+            ax.set_xticklabels(TIME_COLS, rotation=45)
             ax.set_ylabel("인원수")
             ax.legend()
             st.pyplot(fig)
 
-            # 요일별 평균 분석 (Altair 사용)
+            # ── Altair 요일별 평균 ──
             st.write("### 📅 요일별 평균 유동인구 (Altair)")
-            weekday_order = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
-            plot_data = []
-
+            weekday_order = ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']
+            plot_df_list = []
             for 역 in 역명_list:
-                sub = df[df['역명'] == 역]
+                sub = pop_df[pop_df['역명'] == 역]
                 if 구분 != '전체':
                     sub = sub[sub['승하차구분'] == 구분]
-                grouped = sub.groupby('요일')['총유동인구'].mean().reindex(weekday_order).reset_index()
+                grouped = (sub.groupby('요일')['총유동인구']
+                              .mean()
+                              .reindex(weekday_order)
+                              .reset_index())
                 grouped['역명'] = 역
-                plot_data.append(grouped)
-
-            chart_df = pd.concat(plot_data)
-
+                plot_df_list.append(grouped)
+            chart_df = pd.concat(plot_df_list)
             chart = alt.Chart(chart_df).mark_line(point=True).encode(
-                x=alt.X('요일:N', sort=weekday_order, title='요일'),
-                y=alt.Y('총유동인구:Q', title='유동인구 수'),
+                x=alt.X('요일:N', sort=weekday_order),
+                y='총유동인구:Q',
                 color='역명:N',
-                tooltip=['역명', '요일', '총유동인구']
-            ).properties(
-                width=600,
-                height=400,
-                title='요일별 유동인구 비교 (Altair)'
-            )
-
+                tooltip=['역명','요일','총유동인구']
+            ).properties(width=600, height=400)
             st.altair_chart(chart, use_container_width=True)
 
-            # 총 유동인구 월별 추이 (역별 분리 Altair)
+            # ── 월별 추이 ──
             st.write("### 📈 월별 총 유동인구 추이 (역별 비교)")
-
-            monthly_df = df[(df['역명'].isin(역명_list))].copy()
+            mdf = pop_df[pop_df['역명'].isin(역명_list)].copy()
             if 구분 != '전체':
-                monthly_df = monthly_df[monthly_df['승하차구분'] == 구분]
+                mdf = mdf[mdf['승하차구분'] == 구분]
+            mdf['월'] = mdf['수송일자'].dt.to_period('M').astype(str)
+            m_grouped = mdf.groupby(['월','역명'])['총유동인구'].sum().reset_index()
+            m_chart = alt.Chart(m_grouped).mark_line(point=True).encode(
+                x='월:N', y='총유동인구:Q', color='역명:N', tooltip=['월','역명','총유동인구']
+            ).properties(width=700, height=400)
+            st.altair_chart(m_chart, use_container_width=True)
 
-            monthly_df['월'] = monthly_df['수송일자'].dt.to_period('M').astype(str)
-            monthly_grouped = monthly_df.groupby(['월', '역명'])['총유동인구'].sum().reset_index()
-
-            monthly_chart = alt.Chart(monthly_grouped).mark_line(point=True).encode(
-                x=alt.X('월:N', title='월'),
-                y=alt.Y('총유동인구:Q', title='유동인구 수'),
-                color=alt.Color('역명:N'),
-                tooltip=['월', '역명', '총유동인구']
-            ).properties(
-                width=700,
-                height=400
-            )
-
-            st.altair_chart(monthly_chart, use_container_width=True)
+        # ── 통계 요약 ──
         with col_stats:
-            st.subheader("📌 통계 요약 (표 형식)")
-
+            st.subheader("📌 통계 요약")
             rows = []
-            weekday = ['월요일', '화요일', '수요일', '목요일', '금요일']
-
+            weekday = ['월요일','화요일','수요일','목요일','금요일']
             for 역 in 역명_list:
-                역_filtered = filtered[filtered['역명'] == 역]
-                노선들 = df[df['역명'] == 역]['호선'].unique()
-                total_flow = 역_filtered['총유동인구'].sum()
-
-                daily_by_day = 역_filtered.groupby('요일')['총유동인구'].mean().round(1)
-                평일 = daily_by_day[daily_by_day.index.isin(weekday)].mean() if any(daily_by_day.index.isin(weekday)) else 0
-                토요일 = daily_by_day.get('토요일', 0)
-                일요일 = daily_by_day.get('일요일', 0)
-
+                sub = filtered[filtered['역명'] == 역]
+                노선 = pop_df[pop_df['역명'] == 역]['호선'].unique()
+                total = int(sub['총유동인구'].sum())
+                by_day = sub.groupby('요일')['총유동인구'].mean()
+                평일 = by_day[by_day.index.isin(weekday)].mean() if not by_day.empty else 0
+                토 = by_day.get('토요일',0)
+                일 = by_day.get('일요일',0)
                 rows.append({
-                    "역명": 역,
-                    "노선": ", ".join(노선들),
-                    "전체 유동인구": f"{int(total_flow):,}",
-                    "평일 평균": f"{int(평일):,}",
-                    "토요일 평균": f"{int(토요일):,}",
-                    "일요일 평균": f"{int(일요일):,}",
+                    '역명':역,
+                    '노선':", ".join(노선),
+                    '전체 유동인구':f"{total:,}",
+                    '평일 평균':f"{int(평일):,}",
+                    '토요일 평균':f"{int(토):,}",
+                    '일요일 평균':f"{int(일):,}"
                 })
+            stat_df = pd.DataFrame(rows).set_index('역명').T
+            st.dataframe(stat_df)
 
-            summary_df = pd.DataFrame(rows).set_index("역명").T
-            st.dataframe(summary_df)
-
+            # ── 유동인구 순위 ──
             if len(역명_list) > 1:
                 st.subheader("🏆 유동인구 순위")
-
                 total_rank = filtered.groupby('역명')['총유동인구'].sum().sort_values(ascending=False)
-                st.write("**전체 기간 유동인구 순위**")
                 st.table(total_rank.rename("명"))
 
-                st.write("**요일별 유동인구 순위**")
-                day_rank = filtered.groupby(['요일', '역명'])['총유동인구'].sum().unstack().fillna(0)
-                st.dataframe(day_rank.style.format("{:,.0f}"))
     else:
         st.warning("선택한 조건에 해당하는 데이터가 없습니다.")
 
-# 상가 위치 보기 탭
+# ----------------------------------------------------------
+# 🏪 TAB 2 : 상가 위치 & 입체 구조도 + 임대 데이터
+# ----------------------------------------------------------
 with tab2:
-    st.subheader("🏪 선택한 역의 상가 및 입체 구조도")
+    st.subheader("🏪 선택한 역의 상가 · 입체 구조도 · 임대 현황")
+
+    # ────────────────────────────────────────────────────────
+    # 선택한 모든 역을 순회 (다중 노선이라도 전부 처리)
+    # ────────────────────────────────────────────────────────
     for 역 in 역명_list:
-        code_rows = df[df['역명'] == 역]
-        if code_rows.empty:
+        # 한 역이 여러 노선에 걸쳐 있을 수 있으므로 → 모든 코드 수집
+        codes = (pop_df[pop_df['역명'] == 역]['역번호']
+                    .dropna()
+                    .unique())
+
+        if len(codes) == 0:
             continue
-        codes = code_rows['역번호'].unique()
+
+        st.markdown(f"## 🚉 {역}")
+
         for code in codes:
-            # 파일명 통일 규칙 → "코드(역명).jpg"
-            filename = f"{int(code)}({역}).jpg"
-            shop_path   = os.path.join("./상가위치도", filename)
-            struct_path = os.path.join("./입체구조도", filename)
+            code = int(code)          # numpy 타입 → int 로 변환
+            st.markdown(f"### 노선 코드: {code}")
 
-            col1, col2 = st.columns(2)
+            img_col1, img_col2 = st.columns(2)
 
-            # ───── 상가 위치도 ─────
-            with col1:
-                if os.path.exists(shop_path):
-                    st.image(Image.open(shop_path),
-                             caption=f"[상가위치도] {역} ({code})",
-                             use_container_width=True)
-                else:
-                    # 폴더 구조가 바뀌었을 수도 있으니 역명 기준으로 보조 검색
-                    alt_shop = glob.glob(f"상가위치도/**/{역}*.jp*g", recursive=True)
-                    if alt_shop:
-                        st.image(alt_shop[0],
-                                 caption=f"[상가위치도] {os.path.basename(alt_shop[0])}",
+            # ── 상가 위치도 ────────────────────────────────
+            with img_col1:
+                # 역명 먼저 검색 → 없으면 코드로 백업
+                shop_matches = glob.glob(
+                    f"상가위치도/**/{역}*.jp*g", recursive=True)
+
+                if not shop_matches:
+                    shop_matches = glob.glob(
+                        f"상가위치도/**/{code}(*.jp*g", recursive=True)
+
+                if shop_matches:
+                    for p in shop_matches:
+                        st.image(p, caption=os.path.basename(p),
                                  use_container_width=True)
-                    else:
-                        st.warning(f"{역}의 상가 이미지({code})가 없습니다.")
-
-            # ───── 입체 구조도 ─────
-            with col2:
-                if os.path.exists(struct_path):
-                    st.image(Image.open(struct_path),
-                             caption=f"[입체구조도] {역} ({code})",
-                             use_container_width=True)
                 else:
-                    # 역명으로 백업 검색 (폴더/확장자 다양성 대비)
-                    struct_images = glob.glob(f"입체구조도/**/{역}*.jp*g", recursive=True)
-                    if struct_images:
-                        st.image(struct_images[0],
-                                 caption=f"[입체구조도] {os.path.basename(struct_images[0])}",
+                    st.info("상가 위치도 이미지 없음")
+
+            # ── 입체 구조도 ────────────────────────────────
+            with img_col2:
+                # 역명 먼저 검색 → 없으면 코드로 백업
+                struct_matches = glob.glob(
+                    f"입체구조도/**/{역}*.jp*g", recursive=True)
+
+                if not struct_matches:
+                    struct_matches = glob.glob(
+                        f"입체구조도/**/{code}(*.jp*g", recursive=True)
+
+                if struct_matches:
+                    for p in struct_matches:
+                        st.image(p, caption=os.path.basename(p),
                                  use_container_width=True)
-                    else:
-                        st.info(f"{역}의 입체구조도 이미지가 없습니다.")
+                else:
+                    st.info("입체 구조도 이미지 없음")
+
+            # ── 임대 현황 표  ──────────────────────────────
+            lease = store_df[store_df["역번호"] == code]
+            if lease.empty:
+                st.info("임대 현황 데이터가 없습니다.")
+            else:
+                show_cols = ['상가유형', '호선', '상가번호', '면적(제곱미터)',
+                             '영업업종', '계약시작일자', '계약종료일자',
+                             '월임대료', '사업진행단계']
+                st.dataframe(lease[show_cols].reset_index(drop=True))
